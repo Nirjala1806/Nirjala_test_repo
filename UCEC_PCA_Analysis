@@ -1,0 +1,250 @@
+
+library(ggplot2)
+library(ggrepel)
+library(factoextra)
+library(tidyverse)
+setwd("C:/Users/alajriN/OneDrive - Constructor University/UCEC_data")
+
+clinical <- read.csv("clinical.xls", row.names = 1)
+# Replace empty strings with NA in tumor stage column
+clinical$tumor_Stage.Pathological[clinical$tumor_Stage.Pathological == ""] <- NA
+
+# Replace empty strings with NA in histologic type column
+clinical$Histologic_type[clinical$Histologic_type == ""] <- NA
+
+# Set tumor stage as the colour variable for PCA plots
+COLOUR_COL <- "tumor_Stage.Pathological"
+
+# Confirm the groups and sample counts
+table(clinical$tumor_Stage.Pathological, useNA = "always")
+plot_histogram <- function(filepath, layer_name, skip_rows = 0) {
+  
+  # Load the CSV file
+  df <- read.csv(filepath, row.names = 1, check.names = FALSE, skip = skip_rows)
+  
+  # Keep only numeric columns
+  df <- df[, sapply(df, is.numeric), drop = FALSE]
+  
+  # Convert all values into one long vector for plotting
+  # We sample up to 500000 values to keep plotting fast
+  # for large layers like phosphoproteomics
+  all_values <- as.vector(as.matrix(df))
+  all_values <- all_values[!is.na(all_values)]
+  
+  if (length(all_values) > 500000) {
+    set.seed(42)
+    all_values <- sample(all_values, 500000)
+  }
+  
+  plot_df <- data.frame(value = all_values)
+  
+  # Calculate mean and median for reference lines
+  mean_val   <- mean(all_values)
+  median_val <- median(all_values)
+  
+  # Build histogram
+  p <- ggplot(plot_df, aes(x = value)) +
+    geom_histogram(bins = 100, fill = "steelblue",
+                   colour = "white", linewidth = 0.1) +
+    geom_vline(xintercept = mean_val, colour = "tomato",
+               linetype = "dashed", linewidth = 0.8) +
+    geom_vline(xintercept = median_val, colour = "darkgreen",
+               linetype = "dashed", linewidth = 0.8) +
+    annotate("text", x = mean_val, y = Inf,
+             label = paste0("Mean = ", round(mean_val, 2)),
+             colour = "tomato", vjust = 2, hjust = -0.1, size = 3.5) +
+    annotate("text", x = median_val, y = Inf,
+             label = paste0("Median = ", round(median_val, 2)),
+             colour = "darkgreen", vjust = 4, hjust = -0.1, size = 3.5) +
+    labs(
+      title    = paste("Value Distribution -", layer_name),
+      subtitle = paste0(nrow(df), " samples  |  ",
+                        ncol(df), " features  |  ",
+                        length(all_values), " values plotted"),
+      x = "Value",
+      y = "Count"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"))
+  
+  # Save histogram as PNG
+  fname <- paste0("Histogram_", gsub(" ", "_", layer_name), ".png")
+  ggsave(fname, plot = p, width = 7, height = 5, dpi = 150)
+  
+  # Display in RStudio
+  print(p)
+}
+
+
+
+run_pca_and_plot <- function(filepath, layer_name, clinical_df, colour_col,
+                             skip_rows = 0, missing_threshold = 0.50) {
+  
+  # Load the CSV file
+  # skip_rows = 0 for most layers
+  # skip_rows = 2 for phosphoproteomics and acetylproteomics
+  # because they have two extra header rows
+  df <- read.csv(filepath, row.names = 1, check.names = FALSE, skip = skip_rows)
+  
+  # Keep only numeric columns
+  # PCA can only work on numbers — text columns are removed
+  df <- df[, sapply(df, is.numeric), drop = FALSE]
+  
+  # Remove features where more than missing_threshold of values are missing
+  # Default is 50% — features missing in more than half the samples
+  # are too unreliable to use in PCA
+  missing_rate <- colMeans(is.na(df))
+  df <- df[, missing_rate < missing_threshold, drop = FALSE]
+  
+  # Remove features where ALL values are missing
+  # These columns have no data at all — median would still return NA
+  df <- df[, colSums(!is.na(df)) > 0, drop = FALSE]
+  
+  # Impute remaining missing values with the column median
+  # Median is more robust to outliers than mean
+  for (col in colnames(df)) {
+    na_idx <- is.na(df[[col]])
+    if (any(na_idx)) {
+      df[[col]][na_idx] <- median(df[[col]], na.rm = TRUE)
+    }
+  }
+  
+  # Remove any columns that still have NAs after imputation
+  # This happens when exactly 50% of values are missing
+  df <- df[, colSums(is.na(df)) == 0, drop = FALSE]
+  
+  # Remove any rows that still have NAs — final safety net
+  df <- df[complete.cases(df), , drop = FALSE]
+  
+  # Remove zero-variance features
+  # prcomp cannot scale features with zero variance
+  # We use 1e-10 instead of exactly 0 for floating point safety
+  col_vars <- apply(df, 2, var, na.rm = TRUE)
+  df <- df[, !is.na(col_vars) & col_vars > 1e-10, drop = FALSE]
+  
+  # Run PCA
+  # scale. = TRUE applies z-score normalisation (mean = 0, sd = 1)
+  # center = TRUE subtracts the mean from each feature before scaling
+  pca_result <- prcomp(df, scale. = TRUE, center = TRUE)
+  
+  # Calculate percentage of variance explained by each PC
+  # sdev^2 = eigenvalue = variance of each PC
+  # dividing by total variance gives proportion, x100 gives percentage
+  variance_explained <- (pca_result$sdev^2 / sum(pca_result$sdev^2)) * 100
+  
+  # Extract PC scores — coordinates of each sample in PC space
+  scores <- as.data.frame(pca_result$x[, 1:min(10, ncol(pca_result$x))])
+  scores$Sample <- rownames(scores)
+  
+  # Match colour labels from clinical data to these samples
+  # match() aligns clinical labels to whichever samples exist in this layer
+  scores$Group <- as.factor(clinical_df[match(rownames(scores),
+                                              rownames(clinical_df)),
+                                        colour_col])
+  
+  # Define colour palette for tumor stages
+  stage_colors <- c(
+    "Stage I"   = "#2196F3",   # blue
+    "Stage II"  = "#4CAF50",   # green
+    "Stage III" = "#FF9800",   # orange
+    "Stage IV"  = "#F44336"    # red
+  )
+  
+  # PC1 vs PC2 scatter plot coloured by tumor stage
+  p1 <- ggplot(scores, aes(x = PC1, y = PC2, colour = Group)) +
+    geom_point(size = 2.5, alpha = 0.8) +
+    scale_colour_manual(values = stage_colors, na.value = "grey70") +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+    labs(
+      title    = paste("PCA -", layer_name),
+      subtitle = paste0("n = ", nrow(df), " samples,  ",
+                        ncol(df), " features"),
+      x        = paste0("PC1  (", round(variance_explained[1], 1), "%)"),
+      y        = paste0("PC2  (", round(variance_explained[2], 1), "%)"),
+      colour   = "Tumor Stage"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"))
+  
+  # Scree plot showing variance per PC
+  # Red line = cumulative variance
+  # Dotted line = 80% threshold
+  n_pcs    <- min(10, length(variance_explained))
+  scree_df <- data.frame(
+    PC         = factor(paste0("PC", 1:n_pcs), levels = paste0("PC", 1:n_pcs)),
+    Variance   = variance_explained[1:n_pcs],
+    Cumulative = cumsum(variance_explained[1:n_pcs])
+  )
+  
+  p2 <- ggplot(scree_df, aes(x = PC)) +
+    geom_bar(aes(y = Variance), stat = "identity",
+             fill = "steelblue", colour = "white", width = 0.7) +
+    geom_line(aes(y = Cumulative, group = 1),
+              colour = "tomato", linewidth = 1.2) +
+    geom_point(aes(y = Cumulative), colour = "tomato", size = 2.5) +
+    geom_hline(yintercept = 80, linetype = "dotted",
+               colour = "grey40", linewidth = 0.8) +
+    geom_text(aes(y = Variance + 1.5,
+                  label = paste0(round(Variance, 1), "%")),
+              size = 3, vjust = 0) +
+    labs(
+      title = paste("Scree Plot -", layer_name),
+      x     = "Principal Component",
+      y     = "Explained Variance (%)"
+    ) +
+    scale_y_continuous(limits = c(0, 108)) +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"))
+  
+  # Save both plots as PNG files
+  ggsave(paste0("PCA_scatter_", gsub(" ", "_", layer_name), ".png"),
+         plot = p1, width = 7, height = 5, dpi = 150)
+  ggsave(paste0("PCA_scree_", gsub(" ", "_", layer_name), ".png"),
+         plot = p2, width = 7, height = 5, dpi = 150)
+  
+  # Display plots in RStudio
+  print(p1)
+  print(p2)
+  
+  # Return summary numbers for the final summary table
+  return(list(
+    layer              = layer_name,
+    n_samples          = nrow(df),
+    n_features         = ncol(df),
+    PC1                = round(variance_explained[1], 2),
+    PC2                = round(variance_explained[2], 2),
+    PC3                = round(variance_explained[3], 2),
+    cumulative_PC1_PC2 = round(sum(variance_explained[1:2]), 2)
+  ))
+}
+
+
+# ── Histograms ────────────────────────────────────────────────────
+plot_histogram("transcriptomics.xls",   "Transcriptomics")
+plot_histogram("proteomics.xls",        "Proteomics")
+plot_histogram("phosphoproteomics.xls", "Phosphoproteomics", skip_rows = 2)
+plot_histogram("miRNA.xls",             "miRNA")
+plot_histogram("CNV.xls",               "CNV")
+plot_histogram("acetylproteomics.xls",  "Acetylproteomics",  skip_rows = 2)
+plot_histogram("circular_RNA.xls",      "circular_RNA")
+
+# ── PCA ───────────────────────────────────────────────────────────
+all_results <- list()
+
+all_results[["Transcriptomics"]]   <- run_pca_and_plot("transcriptomics.xls",   "Transcriptomics",   clinical, COLOUR_COL)
+all_results[["Proteomics"]]        <- run_pca_and_plot("proteomics.xls",        "Proteomics",        clinical, COLOUR_COL)
+all_results[["Phosphoproteomics"]] <- run_pca_and_plot("phosphoproteomics.xls", "Phosphoproteomics", clinical, COLOUR_COL, skip_rows = 2)
+all_results[["miRNA"]]             <- run_pca_and_plot("miRNA.xls",             "miRNA",             clinical, COLOUR_COL)
+all_results[["CNV"]]               <- run_pca_and_plot("CNV.xls",               "CNV",               clinical, COLOUR_COL)
+all_results[["Acetylproteomics"]]  <- run_pca_and_plot("acetylproteomics.xls",  "Acetylproteomics",  clinical, COLOUR_COL, skip_rows = 2)
+all_results[["circular_RNA"]]      <- run_pca_and_plot("circular_RNA.xls",      "circular_RNA",      clinical, COLOUR_COL)
+summary_df <- do.call(rbind, lapply(all_results, as.data.frame))
+
+rownames(summary_df) <- NULL
+
+summary_df <- summary_df[order(summary_df$cumulative_PC1_PC2, decreasing = TRUE), ]
+
+print(summary_df)
+
+write.csv(summary_df, "UCEC_PCA_summary.csv", row.names = FALSE)
