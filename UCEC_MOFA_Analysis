@@ -1,0 +1,293 @@
+library(MOFA2)
+library(data.table)
+library(ggplot2)
+library(tidyverse)
+library(reticulate)
+library(psych)
+
+setwd("C:/Users/alajriN/OneDrive - Constructor University/UCEC_data")
+
+# Helper function to load each omics layer
+# MOFA2 requires features as ROWS and samples as COLUMNS
+# This is the opposite of PCA where samples were rows
+load_omics <- function(filepath, layer_name, skip_rows = 0) {
+  
+  # Load the CSV file
+  df <- read.csv(filepath, row.names = 1,
+                 check.names = FALSE, skip = skip_rows)
+  
+  # Keep only numeric columns
+  # MOFA2 cannot handle text columns
+  df <- df[, sapply(df, is.numeric), drop = FALSE]
+  
+  # Remove features with more than 50% missing values
+  # Features missing in more than half the samples are unreliable
+  missing_rate <- colMeans(is.na(df))
+  df <- df[, missing_rate < 0.50, drop = FALSE]
+  
+  # Remove completely empty features
+  # These have no data at all and cannot be used
+  df <- df[, colSums(!is.na(df)) > 0, drop = FALSE]
+  
+  # Transpose so features are rows and samples are columns
+  # MOFA2 requires this exact orientation
+  df <- t(df)
+  
+  message(layer_name, ": ", nrow(df), " features x ", ncol(df), " samples")
+  
+  return(df)
+}
+
+# Load all 7 omics layers
+# skip_rows = 2 for phosphoproteomics and acetylproteomics
+# because those files have two extra header rows
+omics_list <- list(
+  Transcriptomics   = load_omics("transcriptomics.xls",   "Transcriptomics"),
+  Proteomics        = load_omics("proteomics.xls",        "Proteomics"),
+  Phosphoproteomics = load_omics("phosphoproteomics.xls", "Phosphoproteomics", skip_rows = 2),
+  miRNA             = load_omics("miRNA.xls",             "miRNA"),
+  CNV               = load_omics("CNV.xls",               "CNV"),
+  Acetylproteomics  = load_omics("acetylproteomics.xls",  "Acetylproteomics",  skip_rows = 2),
+  circular_RNA      = load_omics("circular_RNA.xls",      "circular_RNA")
+)
+
+# Find samples that are present in ALL 7 omics layers simultaneously
+# Each layer has a different number of samples so we find the common set
+common_samples <- Reduce(intersect, lapply(omics_list, colnames))
+message("Common samples across all 7 layers: ", length(common_samples))
+
+# Subset every layer to only the common samples in the same order
+# MOFA2 requires all views to have exactly the same samples
+omics_list <- lapply(omics_list, function(x) {
+  x[, common_samples, drop = FALSE]
+})
+
+# Confirm all layers now have the same dimensions
+message("Dimensions after alignment:")
+lapply(omics_list, dim)
+
+# Load clinical data
+clinical <- read.csv("clinical.xls", row.names = 1)
+
+# Replace empty strings with NA in tumor stage column
+clinical$tumor_Stage.Pathological[clinical$tumor_Stage.Pathological == ""] <- NA
+
+# Replace empty strings with NA in histological type column
+clinical$Histologic_type[clinical$Histologic_type == ""] <- NA
+
+# MOFA2 requires a column called 'sample' with the sample IDs
+# This is how MOFA2 matches metadata to samples in the model
+clinical$sample <- rownames(clinical)
+
+# Subset clinical to only the common samples
+clinical <- clinical[clinical$sample %in% common_samples, ]
+
+message("Clinical data: ", nrow(clinical), " samples")
+print(table(clinical$tumor_Stage.Pathological, useNA = "always"))
+# Create the MOFA object from the list of 7 omics matrices
+MOFAobject <- create_mofa(omics_list)
+
+# Print a summary of the object
+# Shows number of views, samples, features per view
+MOFAobject
+
+# Visualise data overview
+# Rows = omics layers (views)
+# Columns = samples
+# Grey bars = missing data
+plot_data_overview(MOFAobject)
+
+# Data options
+# scale_views = TRUE scales all omics layers to the same variance
+# This is important because your layers have very different value ranges
+# e.g. transcriptomics values are very different from CNV values
+data_opts <- get_default_data_options(MOFAobject)
+data_opts$scale_views <- TRUE
+
+# Model options
+# num_factors = 15 latent factors to learn
+# MOFA will automatically drop factors that explain no variance
+model_opts <- get_default_model_options(MOFAobject)
+model_opts$num_factors <- 15L
+
+# Training options
+# convergence_mode = "slow" gives the most accurate results
+# seed = 42 makes results reproducible
+# maxiter = 1000 maximum number of training iterations
+train_opts <- get_default_training_options(MOFAobject)
+train_opts$convergence_mode <- "slow"
+train_opts$seed <- 42L
+train_opts$maxiter <- 1000L
+train_opts$outfile <- "UCEC_MOFA2.hdf5"
+
+
+# Prepare the MOFA object with all options defined above
+MOFAobject <- prepare_mofa(
+  MOFAobject,
+  data_options     = data_opts,
+  model_options    = model_opts,
+  training_options = train_opts
+)
+
+# Connect R to your Python mofa_env conda environment
+# mofa_env is located at C:/Users/alajriN/.conda/envs/mofa_env
+# This is needed because MOFA2 training runs in Python under the hood
+use_condaenv(
+  condaenv = "C:/Users/alajriN/.conda/envs/mofa_env",
+  required = TRUE
+)
+
+# Confirm Python and mofapy2 are connected before training
+py_run_string("import mofapy2; print('mofapy2 ready!')")
+
+# Train the MOFA model
+# This takes approximately 10-20 minutes
+# You will see iteration numbers printing — this is normal
+# Do NOT close RStudio while training is running
+MOFAobject <- run_mofa(MOFAobject)
+
+# Save the trained model as an R object
+# Next time you open RStudio load it with:
+# MOFAobject <- readRDS("UCEC_MOFA2.rds")
+saveRDS(MOFAobject, "UCEC_MOFA2.rds")
+
+
+# If starting a new R session reload the model with:
+# MOFAobject <- readRDS("UCEC_MOFA2.rds")
+
+# Add clinical metadata to the trained model
+# This allows us to colour plots by tumor stage and histological type
+samples_metadata(MOFAobject) <- clinical
+
+# Check that factors are not correlated with each other
+# In a good MOFA model factors should be largely independent
+# High correlation between factors suggests poor model fit
+plot_factor_cor(MOFAobject)
+
+# Plot variance explained by each factor across each omics layer
+# This is the MOST IMPORTANT plot in MOFA
+# Rows = omics layers, Columns = factors
+# Darker colour = more variance explained by that factor in that layer
+# Factors active in multiple layers = shared biological signal
+# Factors active in one layer only = layer-specific signal
+plot_variance_explained(MOFAobject, max_r2 = 15)
+
+# Plot total variance explained per omics layer
+# Shows how well the model fits each data type overall
+plot_variance_explained(MOFAobject, plot_total = TRUE)[[2]]
+
+# Plot Factor 1 values per sample coloured by tumor stage
+# Shows whether Factor 1 separates patients by disease stage
+# Violin plots show the distribution of factor values per group
+plot_factor(MOFAobject,
+            factors    = 1,
+            color_by   = "tumor_Stage.Pathological",
+            add_violin = TRUE,
+            dodge      = TRUE
+)
+
+# Plot Factor 2 values coloured by tumor stage
+plot_factor(MOFAobject,
+            factors    = 2,
+            color_by   = "tumor_Stage.Pathological",
+            add_violin = TRUE,
+            dodge      = TRUE
+)
+
+# Plot Factor 3 values coloured by tumor stage
+# Factor 3 may be more biologically meaningful than 1 and 2
+# due to the technical variation warning we received during training
+plot_factor(MOFAobject,
+            factors    = 3,
+            color_by   = "tumor_Stage.Pathological",
+            add_violin = TRUE,
+            dodge      = TRUE
+)
+
+# Plot Factor 1 vs Factor 2 scatter coloured by tumor stage
+# This is equivalent to a PCA scatter plot but using MOFA factors
+# Each dot = one sample, coloured by tumor stage
+plot_factors(MOFAobject,
+             factors  = c(1, 2),
+             color_by = "tumor_Stage.Pathological",
+             dot_size = 2.5
+)
+
+plot_factors(MOFAobject,
+             factors  = c(2, 3),
+             color_by = "tumor_Stage.Pathological",
+             dot_size = 2.5
+)
+
+
+# Factor 1 weights per omics layer
+# Factor 1 is driven by one Stage IV outlier with extreme CNV deletions
+# including MDM4, PIK3C2B and KISS1 — known tumor suppressor genes
+plot_top_weights(MOFAobject,
+                 view = "Transcriptomics", factor = 1, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "Proteomics", factor = 1, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "Phosphoproteomics", factor = 1, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "miRNA", factor = 1, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "CNV", factor = 1, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "Acetylproteomics", factor = 1, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "circular_RNA", factor = 1, nfeatures = 10, scale = TRUE)
+
+# Factor 2 weights per omics layer
+# Factor 2 is the most biologically interesting
+# it is active across 5 omics layers simultaneously
+plot_top_weights(MOFAobject,
+                 view = "Transcriptomics", factor = 2, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "Proteomics", factor = 2, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "Phosphoproteomics", factor = 2, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "miRNA", factor = 2, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "CNV", factor = 2, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "Acetylproteomics", factor = 2, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "circular_RNA", factor = 2, nfeatures = 10, scale = TRUE)
+
+# Factor 3 weights per omics layer
+# Factor 3 shows higher values in Stage IV
+# so its weights reveal which features drive tumor progression
+plot_top_weights(MOFAobject,
+                 view = "Transcriptomics", factor = 3, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "Proteomics", factor = 3, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "Phosphoproteomics", factor = 3, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "miRNA", factor = 3, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "CNV", factor = 3, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "Acetylproteomics", factor = 3, nfeatures = 10, scale = TRUE)
+
+plot_top_weights(MOFAobject,
+                 view = "circular_RNA", factor = 3, nfeatures = 10, scale = TRUE)
